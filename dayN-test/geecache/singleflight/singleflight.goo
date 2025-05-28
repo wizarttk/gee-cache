@@ -1,0 +1,86 @@
+/*
+      Group.Do流程图
+      ┌────────────┐
+      │ G.Do(key)  │
+      └────┬───────┘
+           │
+           ▼
+      锁住 Group
+           │
+   map 中是否存在 key？
+      ├── 是 ──▶  解锁，等待已有 call 完成 → 共享结果
+      └── 否
+           │
+    创建 call + 添加 map
+           │
+          解锁
+           │
+      执行 fn()
+           │
+      保存 val/err
+           │
+      call.Done()
+           │
+     清理 map[key]
+           │
+     返回 val/err
+*/
+// 实现了一个核心机制，相同key的并发调用只会调用一次，其他调用等待结果并共享返回值（请求合并）
+package singleflight
+
+import "sync"
+
+// call结构体 表示某个key的一次正在执行或已完成的函数调用的"状态对象"
+type call struct {
+	wg  sync.WaitGroup // wg  表示这个call是否完成（用于让其他goroutine等待）
+	val interface{}    // val 调用 fn() 得到的结果
+	err error          // err 调用 fn() 的错误
+}
+
+// Group结构体 整个 singleflight 的核心结构，管理所有的call
+// 同一个 key 同一时间最多智慧存在一个 *call
+type Group struct {
+	mu sync.Mutex       // 保证map并发安全
+	m  map[string]*call // 记录当前正在执行中的 key 对应的 call，key 是请求参数的唯一标识。
+}
+
+// Do 针对相同的 key，无论 Do 被调用多少次，函数 fn 都只会被调用一次，等待 fn 调用结束了，返回返回值或错误。
+// - key 这次调用的"唯一标识"（比如某个数据的缓存 key）
+// - fn 真正要执行的函数（只有一个 goroutine 会执行它）
+// 返回值： 1. 函数返回的值 2. 函数执行中的错误
+func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+	// 1. 加锁并检查是否已有相同 key 的 call 正在运行
+	g.mu.Lock() // 锁住整个结构，防止多个并发协程同时读写 map
+
+	// 2. 如果第一次使用Group，懒加载 map
+	if g.m == nil {
+		g.m = make(map[string]*call) // 懒加载：第一次调用才创建 map
+	}
+
+	// 3. 如果 map 中已经有该 key 的 call（说明另一个 goroutine 正在执行）,那就等待他执行完：
+	if c, ok := g.m[key]; ok {
+		g.mu.Unlock()       // 解锁
+		c.wg.Wait()         // 等待该任务执行完
+		return c.val, c.err // 等到原任务完成后，返回它执行的结果：val 和 err
+	}
+
+	// 4. 如果没有这个 key 的 call，那我来做！
+	c := new(call) // 创建一个新的 call 实例（就是这次任务） （等价于c:=&call{}）
+	c.wg.Add(1)    // 表示这个 call 正在执行中
+	g.m[key] = c   // 把它放到 map 中，让其他人能找到它并等待
+	g.mu.Unlock()  // 解锁让别人可以并发进来等待这个 call
+
+	// 5. 执行用户传入的真正函数（比如从数据库加载缓存）
+	c.val, c.err = fn() // 执行传入的函数 fn()，并保存结果
+	c.wg.Done()         // 调用 Done()表示完成，通知其他 goroutine 可以返回结果了
+
+	// 6. 清理当前 call,避免内存泄漏
+	// g.m 是全局共享的 map，所有 key 都存在里面，所有协程都可能操作这个结构。
+	// 虽然对同一个 key 的后续协程在 c.wg.Wait() 后就返回了，但整个 g.m 是所有 key 的共享 map，**其它协程对其它 key 调用 Do 方法时仍然会访问、修改这个 map，因此 delete(g.m, key) 必须加锁。
+	g.mu.Lock()
+	delete(g.m, key) // 再删除掉 m[key]，这样下次对这个 key 的调用可以再次执行，注意我们等fn()完成后才删除，确保不会有别人还在等待它
+	g.mu.Unlock()
+
+	// 7. 返回结果给第一个调用者
+	return c.val, c.err
+}
